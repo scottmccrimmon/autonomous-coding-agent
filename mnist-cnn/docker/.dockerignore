@@ -1,0 +1,33 @@
+
+# Ignore unnecessary files for Docker context
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.swn
+*.swm
+
+# Python virtualenvs
+venv/
+env/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Git & metadata
+.git
+.gitignore
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.code-workspace
+
+# Output artifacts (if preserved locally)
+outputs/
