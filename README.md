@@ -163,4 +163,4 @@ All of these should be approached with the same emphasis on transparency and con
 
 ## License
 
-Add your preferred license here.
+This project is licensed under the MIT License. See the LICENSE file for details.
