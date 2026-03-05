@@ -1,0 +1,22 @@
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# pytest cache
+.pytest_cache/
+
+# Downloaded JSON data
+data/*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
