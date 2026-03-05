@@ -4,7 +4,7 @@
 #
 # Orchestrates the Plan-Act-Reflect loop for autonomous code generation.
 # Migrated from OpenAI Responses API to Anthropic Messages API.
-# Adds ShellSkill (pytest execution) and GitHubSkill (repo + commit).
+# Skills (ShellSkill, GitHubSkill) and the SkillRegistry live in harness/skills/.
 #
 # Dependencies:
 #   pip install anthropic PyGithub
@@ -15,14 +15,24 @@
 #   GITHUB_USERNAME     — GitHub username (for GitHubSkill)
 
 import json
-import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Optional
 
 import anthropic
+
+# ---------------------------------------------------------------------------
+# Skills package import
+#
+# Insert the harness directory into sys.path so the skills package is
+# importable regardless of how loop.py is invoked (directly as a script
+# or via python -m harness.loop from the project root).
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from skills import build_skill_registry  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Path constants — must match the actual repo layout exactly
@@ -348,318 +358,6 @@ def agent_reflect(
 
 
 # ---------------------------------------------------------------------------
-# Skill: Shell execution
-# ---------------------------------------------------------------------------
-
-class ShellSkill:
-    """
-    Executes shell commands in a controlled working directory.
-
-    Intended for pytest and black only — not for git operations.
-    All commands are run with a timeout to prevent runaway processes.
-    stdout and stderr are captured and returned as a single string.
-    """
-
-    DEFAULT_TIMEOUT_SECONDS = 60
-
-    def __init__(self, working_directory: Path):
-        """
-        Initialise the skill with a fixed working directory.
-
-        All commands run by this skill will use working_directory as
-        their current working directory.
-        """
-        self.working_directory = working_directory
-
-    def run(self, command: list, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
-        """
-        Run a shell command and return combined stdout + stderr output.
-
-        Args:
-            command:  Command as a list of strings, e.g. ["pytest", "tests/"]
-            timeout:  Maximum seconds to wait before killing the process.
-
-        Returns:
-            A single string combining stdout and stderr output.
-
-        Raises:
-            RuntimeError if the working directory does not exist.
-        """
-        if not self.working_directory.exists():
-            raise RuntimeError(
-                f"ShellSkill working directory does not exist: "
-                f"{self.working_directory}"
-            )
-
-        print(f"  [shell] Running: {' '.join(command)}")
-
-        result = subprocess.run(
-            command,
-            cwd=self.working_directory,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-
-        combined_output = result.stdout + result.stderr
-        print(combined_output)
-        return combined_output
-
-    def check_syntax(self) -> str:
-        """
-        Run py_compile against every .py file in the project root.
-
-        This catches syntax errors before pytest even attempts to collect
-        tests — giving the Reflect agent precise line-level error messages
-        rather than confusing collection failures.
-
-        Returns a human-readable summary string. If all files pass,
-        returns a brief success message. If any file fails, returns the
-        compiler error details for each failing file.
-        """
-        python_files = list(Path(self.working_directory).rglob("*.py"))
-
-        if not python_files:
-            return "[syntax-check] No .py files found to check."
-
-        errors = []
-        for py_file in sorted(python_files):
-            result = self.run(
-                [sys.executable, "-m", "py_compile", str(py_file)]
-            )
-            if result.strip():
-                relative_path = py_file.relative_to(self.working_directory)
-                errors.append(f"{relative_path}: {result.strip()}")
-
-        if errors:
-            error_summary = "".join(errors)
-            return f"[syntax-check] SYNTAX ERRORS FOUND:{error_summary}"
-
-        return f"[syntax-check] All {len(python_files)} .py files passed syntax check."
-
-    def run_pytest(self) -> str:
-        """
-        Run pytest against the tests/ directory.
-
-        Uses sys.executable to invoke pytest as a module (-m pytest)
-        rather than relying on a 'pytest' binary being on PATH. This
-        ensures the correct virtualenv is always used, regardless of
-        how the harness was launched.
-
-        Returns the full pytest output as a string, which is injected
-        into the Reflect prompt as {{PYTEST_RESULTS}}.
-        """
-        return self.run([sys.executable, "-m", "pytest", "tests/", "-v"])
-
-    def run_black(self) -> str:
-        """
-        Run black formatter across the project root.
-
-        Uses sys.executable to invoke black as a module, consistent
-        with run_pytest. Optional — call before pytest if you want
-        consistent formatting in the committed output.
-        """
-        return self.run([sys.executable, "-m", "black", "."])
-
-
-# ---------------------------------------------------------------------------
-# Skill: GitHub repository management
-# ---------------------------------------------------------------------------
-
-class GitHubSkill:
-    """
-    Creates GitHub repositories and commits files via the PyGithub API.
-
-    Design philosophy: linear commits only — no branches, no PRs, no
-    merge conflicts. The agent is the sole writer; the commit history
-    is a clean, auditable trail of what was generated and when.
-
-    Requires:
-        pip install PyGithub
-        Environment variables: GITHUB_PAT, GITHUB_USERNAME
-    """
-
-    def __init__(self):
-        """
-        Initialise the GitHub client from environment variables.
-
-        Raises ImportError if PyGithub is not installed.
-        Raises EnvironmentError if required env vars are missing.
-        """
-        try:
-            from github import Github, GithubException
-            self._GithubException = GithubException
-        except ImportError:
-            raise ImportError(
-                "PyGithub is required for GitHubSkill. "
-                "Install it with: pip install PyGithub"
-            )
-
-        token = os.environ.get("GITHUB_PAT")
-        username = os.environ.get("GITHUB_USERNAME")
-
-        if not token or not username:
-            raise EnvironmentError(
-                "GITHUB_PAT and GITHUB_USERNAME environment variables "
-                "are required for GitHubSkill."
-            )
-
-        from github import Github
-        self.client = Github(token)
-        self.user = self.client.get_user()
-
-    def create_repo(
-        self,
-        name: str,
-        description: str = "",
-        private: bool = False,
-    ):
-        """
-        Create a new GitHub repository.
-
-        If the repository already exists, fetches and returns it instead
-        of raising an error. This makes the operation safe to retry.
-        """
-        try:
-            repo = self.user.create_repo(
-                name=name,
-                description=description,
-                private=private,
-                auto_init=True,  # creates main branch with an initial commit
-            )
-            print(f"  [github] Created repository: {repo.html_url}")
-            return repo
-        except self._GithubException as error:
-            if error.status == 422:
-                print(f"  [github] Repository '{name}' already exists — fetching.")
-                return self.user.get_repo(name)
-            raise
-
-    def commit_files(
-        self,
-        repo_name: str,
-        files: Dict[str, str],
-        commit_message: str,
-        branch: str = "main",
-    ) -> None:
-        """
-        Commit a set of files to the repository's main branch.
-
-        Args:
-            repo_name:      Name of the repository (not the full URL).
-            files:          Dict of {file_path: file_content} to commit.
-            commit_message: Git commit message.
-            branch:         Target branch — defaults to main.
-
-        For each file, uses update_file if it already exists (requiring
-        the current SHA), or create_file if it is new. Always targets
-        the main branch — no branching strategy is used.
-        """
-        repo = self.user.get_repo(repo_name)
-
-        for file_path, content in files.items():
-            try:
-                existing_file = repo.get_contents(file_path, ref=branch)
-                repo.update_file(
-                    path=file_path,
-                    message=commit_message,
-                    content=content,
-                    sha=existing_file.sha,
-                    branch=branch,
-                )
-                print(f"  [github] Updated: {file_path}")
-            except self._GithubException as error:
-                if error.status == 404:
-                    repo.create_file(
-                        path=file_path,
-                        message=commit_message,
-                        content=content,
-                        branch=branch,
-                    )
-                    print(f"  [github] Created: {file_path}")
-                else:
-                    raise
-
-
-# ---------------------------------------------------------------------------
-# Skill registry
-# ---------------------------------------------------------------------------
-
-class SkillRegistry:
-    """
-    Lightweight registry for harness-managed skills.
-
-    Skills are registered by name and called deterministically by the
-    harness — the LLM never decides when to invoke a skill. This keeps
-    operations like pytest runs and GitHub commits predictable and
-    auditable regardless of what the agent produces.
-    """
-
-    def __init__(self):
-        """Initialise with an empty skills dictionary."""
-        self._skills = {}
-
-    def register(self, name: str, skill_instance) -> None:
-        """Register a skill under the given name."""
-        self._skills[name] = skill_instance
-        print(f"  [registry] Registered skill: {name}")
-
-    def get(self, name: str):
-        """
-        Retrieve a registered skill by name.
-
-        Raises KeyError if the skill has not been registered.
-        """
-        if name not in self._skills:
-            raise KeyError(
-                f"Skill '{name}' is not registered. "
-                f"Available skills: {list(self._skills.keys())}"
-            )
-        return self._skills[name]
-
-    @property
-    def available(self) -> list:
-        """Return a list of all registered skill names."""
-        return list(self._skills.keys())
-
-
-# ---------------------------------------------------------------------------
-# Skill registry initialisation
-# ---------------------------------------------------------------------------
-
-def build_skill_registry() -> SkillRegistry:
-    """
-    Build and return the skill registry for this run.
-
-    Skills that lack required environment variables are skipped
-    gracefully so the harness can run without GitHub credentials
-    when needed (e.g. local development and testing).
-    """
-    registry = SkillRegistry()
-
-    # ShellSkill is always available — it has no external dependencies
-    shell_skill = ShellSkill(working_directory=OUTPUT_ROOT)
-    registry.register("shell", shell_skill)
-
-    # GitHubSkill requires credentials — skip gracefully if absent
-    github_pat = os.environ.get("GITHUB_PAT")
-    github_username = os.environ.get("GITHUB_USERNAME")
-
-    if github_pat and github_username:
-        try:
-            registry.register("github", GitHubSkill())
-        except Exception as error:
-            print(f"  [registry] GitHub skill unavailable: {error}")
-    else:
-        print(
-            "  [registry] GitHub skill skipped "
-            "(GITHUB_PAT or GITHUB_USERNAME not set)."
-        )
-
-    return registry
-
-
-# ---------------------------------------------------------------------------
 # Completion check
 # ---------------------------------------------------------------------------
 
@@ -719,7 +417,7 @@ def run_loop(
     print("  PAR Loop Starting")
     print("=" * 60)
 
-    registry = build_skill_registry()
+    registry = build_skill_registry(OUTPUT_ROOT)
     shell = registry.get("shell")
     github_enabled = "github" in registry.available
 
