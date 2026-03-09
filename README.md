@@ -125,7 +125,7 @@ The current demonstration task produces a production-quality FHIR Patient Data P
 * **`test_fhir_pipeline.py`** — A complete `pytest` suite (13/13 tests passing at convergence)
 * **`README.md`** — Documentation for the generated project
 
-All artifacts are committed to a [separate GitHub repository](https://github.com/scottmccrimmon/autonomous-coding-agent) via the `GitHubSkill` upon loop convergence.
+All artifacts can be committed to a separate GitHub repository via the `GitHubSkill` upon loop convergence. The artifacts are committed here for convenient inspection (/fhir-patient-analysis).
 
 The V2 task demonstrates that the PAR loop can handle non-trivial, multi-file engineering deliverables with real quality gates — not just toy examples.
 
